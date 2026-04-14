@@ -524,3 +524,105 @@ Tasklet机制的核心优势在于：
 6. **易于使用**：提供简单的API接口，便于驱动开发者使用
 
 Tasklet的设计理念是在保证中断响应速度的同时，高效地处理各种中断事件，为系统的稳定运行提供保障。
+
+### 14.2 Tasklet的调度和执行机制是怎样的？
+
+当一个tasklet被`tasklet_schedule`调度后，到它在软中断上下文中被执行，中间经历了以下关键步骤：
+
+#### 1. 调度阶段
+
+**步骤1：调用tasklet_schedule**
+- 检查tasklet是否已经被调度（通过`test_and_set_bit`原子操作）
+- 如果未被调度，则调用`__tasklet_schedule`
+
+**步骤2：执行__tasklet_schedule**
+- 保存中断状态并禁用本地中断
+- 将tasklet添加到当前CPU的tasklet队列尾部
+- 更新队列尾部指针
+- 触发`TASKLET_SOFTIRQ`软中断
+- 恢复中断状态
+
+参考代码：[__tasklet_schedule函数](file:///workspace/kernel/softirq.c#L425-L435)
+
+#### 2. 软中断触发阶段
+
+**步骤3：设置软中断标志**
+- `raise_softirq_irqoff`调用`__raise_softirq_irqoff`
+- 通过`or_softirq_pending`设置对应软中断的挂起标志
+
+**步骤4：软中断执行时机**
+- 中断返回时：`irq_exit`函数会检查是否有挂起的软中断
+- 进程调度时：如果有挂起的软中断，会在适当时候执行
+- 显式调用：通过`do_softirq`函数直接触发
+
+参考代码：[irq_exit函数](file:///workspace/kernel/softirq.c#L355-L371)
+
+#### 3. 软中断执行阶段
+
+**步骤5：执行__do_softirq**
+- 检查是否在中断上下文中，如果是则返回
+- 保存中断状态并禁用中断
+- 获取挂起的软中断
+- 禁用底半部
+- 启用中断
+- 遍历执行所有挂起的软中断处理函数
+- 检查是否有新的软中断挂起，如果有且满足条件则重新执行
+- 恢复中断状态
+
+**步骤6：执行tasklet_action**
+- 禁用本地中断
+- 获取当前CPU的tasklet队列
+- 清空队列
+- 启用本地中断
+- 遍历队列中的每个tasklet
+  - 尝试获取tasklet的运行锁
+  - 检查tasklet是否被禁用
+  - 清除调度标志
+  - 执行tasklet的处理函数
+  - 释放运行锁
+  - 对于无法执行的tasklet，重新加入队列并重新触发软中断
+
+参考代码：[tasklet_action函数](file:///workspace/kernel/softirq.c#L464-L497)
+
+#### 4. Tasklet执行阶段
+
+**步骤7：执行tasklet处理函数**
+- 调用用户定义的tasklet处理函数
+- 传递之前设置的参数
+- 处理具体的业务逻辑
+
+#### 完整调用链
+
+```
+tasklet_schedule(t)
+  ↓
+__tasklet_schedule(t)
+  ↓
+raise_softirq_irqoff(TASKLET_SOFTIRQ)
+  ↓
+__raise_softirq_irqoff(NR_SOFTIRQS)
+  ↓
+or_softirq_pending(1UL << TASKLET_SOFTIRQ)
+  ↓
+（中断返回时）
+irq_exit()
+  ↓
+invoke_softirq()
+  ↓
+__do_softirq()
+  ↓
+tasklet_action(a)
+  ↓
+t->func(t->data)
+```
+
+#### 关键技术点
+
+1. **原子操作**：使用`test_and_set_bit`确保同一tasklet不会被重复调度
+2. **per-CPU队列**：每个CPU有独立的tasklet队列，避免跨CPU锁竞争
+3. **中断控制**：在关键操作时禁用中断，确保操作原子性
+4. **软中断机制**：利用软中断实现延迟执行，提高系统响应速度
+5. **锁机制**：使用`tasklet_trylock`和`tasklet_unlock`确保同一tasklet不会在多个CPU上并行执行
+6. **容错处理**：对于无法立即执行的tasklet，重新加入队列并重新触发软中断
+
+这种设计既保证了tasklet执行的安全性和可靠性，又充分利用了多CPU系统的并行处理能力，是Linux内核中处理底半部任务的高效机制。
