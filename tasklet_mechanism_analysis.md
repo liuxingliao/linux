@@ -714,3 +714,110 @@ local_irq_enable();
 - **高效性**：使用原子操作而非重量级锁，开销小
 
 通过这些同步机制，Linux内核保证了tasklet执行的安全性，同时又保持了较高的执行效率。
+
+### 14.4 高优先级tasklet和普通tasklet的区别
+
+高优先级tasklet（使用`tasklet_hi_schedule`调度）和普通tasklet（使用`tasklet_schedule`调度）在调度和执行上有以下主要区别：
+
+#### 1. 队列和软中断类型
+
+**普通tasklet**：
+- 使用`tasklet_vec`队列（per-CPU变量）
+- 触发`TASKLET_SOFTIRQ`软中断
+- 优先级较低
+
+**高优先级tasklet**：
+- 使用`tasklet_hi_vec`队列（per-CPU变量）
+- 触发`HI_SOFTIRQ`软中断
+- 优先级较高
+
+参考代码：[softirq.c中的队列定义](file:///workspace/kernel/softirq.c#L142-L143)
+
+#### 2. 执行顺序
+
+**软中断执行顺序**：
+- `HI_SOFTIRQ`在`TASKLET_SOFTIRQ`之前执行
+- 软中断的执行顺序由`softirq_vec`数组的顺序决定
+- 高优先级tasklet会先于普通tasklet执行
+
+**执行时机**：
+- 当系统处理软中断时，会按照优先级顺序执行不同类型的软中断
+- 高优先级tasklet的处理函数`tasklet_hi_action`会在普通tasklet的处理函数`tasklet_action`之前执行
+
+#### 3. 调度函数
+
+**普通tasklet调度**：
+```c
+static inline void tasklet_schedule(struct tasklet_struct *t)
+{
+    if (!test_and_set_bit(TASKLET_STATE_SCHED, &t->state))
+        __tasklet_schedule(t);
+}
+
+void __tasklet_schedule(struct tasklet_struct *t)
+{
+    unsigned long flags;
+    local_irq_save(flags);
+    t->next = NULL;
+    *__this_cpu_read(tasklet_vec.tail) = t;
+    __this_cpu_write(tasklet_vec.tail, &(t->next));
+    raise_softirq_irqoff(TASKLET_SOFTIRQ);
+    local_irq_restore(flags);
+}
+```
+
+**高优先级tasklet调度**：
+```c
+static inline void tasklet_hi_schedule(struct tasklet_struct *t)
+{
+    if (!test_and_set_bit(TASKLET_STATE_SCHED, &t->state))
+        __tasklet_hi_schedule(t);
+}
+
+void __tasklet_hi_schedule(struct tasklet_struct *t)
+{
+    unsigned long flags;
+    local_irq_save(flags);
+    t->next = NULL;
+    *__this_cpu_read(tasklet_hi_vec.tail) = t;
+    __this_cpu_write(tasklet_hi_vec.tail, &(t->next));
+    raise_softirq_irqoff(HI_SOFTIRQ);
+    local_irq_restore(flags);
+}
+```
+
+#### 4. 执行函数
+
+**普通tasklet执行**：
+- 处理函数：`tasklet_action`
+- 从`tasklet_vec`队列获取tasklet
+
+**高优先级tasklet执行**：
+- 处理函数：`tasklet_hi_action`
+- 从`tasklet_hi_vec`队列获取tasklet
+- 执行逻辑与`tasklet_action`类似，但处理的是高优先级队列
+
+#### 5. 适用场景
+
+**普通tasklet**：
+- 适用于一般的底半部处理任务
+- 对执行时间要求不那么严格的场景
+- 例如：普通的设备中断处理、网络数据包处理等
+
+**高优先级tasklet**：
+- 适用于对执行时间要求较高的任务
+- 需要尽快执行的关键处理
+- 例如：实时性要求较高的设备中断处理、紧急的系统事件处理等
+
+#### 6. 关键区别总结
+
+| 特性 | 普通tasklet | 高优先级tasklet |
+|------|------------|-----------------|
+| 调度函数 | `tasklet_schedule` | `tasklet_hi_schedule` |
+| 软中断类型 | `TASKLET_SOFTIRQ` | `HI_SOFTIRQ` |
+| 队列 | `tasklet_vec` | `tasklet_hi_vec` |
+| 执行顺序 | 后执行 | 先执行 |
+| 优先级 | 较低 | 较高 |
+| 适用场景 | 一般任务 | 紧急任务 |
+
+通过提供高优先级和普通tasklet两种机制，Linux内核允许开发者根据任务的紧急程度选择合适的调度方式，从而更好地满足不同场景的需求。
