@@ -626,3 +626,91 @@ t->func(t->data)
 6. **容错处理**：对于无法立即执行的tasklet，重新加入队列并重新触发软中断
 
 这种设计既保证了tasklet执行的安全性和可靠性，又充分利用了多CPU系统的并行处理能力，是Linux内核中处理底半部任务的高效机制。
+
+### 14.3 如何保证同一tasklet实例在同一时间只能在一个CPU上执行？
+
+Linux内核通过以下同步机制确保同一tasklet实例在同一时间只能在一个CPU上执行：
+
+#### 1. 运行状态标志
+
+**TASKLET_STATE_RUN标志**：
+- 这是一个原子标志，用于标记tasklet是否正在运行
+- 在SMP系统上使用，单CPU系统不需要此标志
+- 定义在`enum { TASKLET_STATE_SCHED, TASKLET_STATE_RUN }`中
+
+#### 2. 原子操作实现
+
+**tasklet_trylock函数**：
+```c
+static inline int tasklet_trylock(struct tasklet_struct *t)
+{
+    return !test_and_set_bit(TASKLET_STATE_RUN, &t->state);
+}
+```
+- 使用`test_and_set_bit`原子操作尝试设置`TASKLET_STATE_RUN`标志
+- 如果标志未设置（返回0），则设置它并返回1（成功获取锁）
+- 如果标志已设置（返回1），则返回0（获取锁失败）
+
+**tasklet_unlock函数**：
+```c
+static inline void tasklet_unlock(struct tasklet_struct *t)
+{
+    smp_mb__before_clear_bit();
+    clear_bit(TASKLET_STATE_RUN, &t->state);
+}
+```
+- 清除`TASKLET_STATE_RUN`标志，释放锁
+- 在清除标志前使用内存屏障`smp_mb__before_clear_bit`，确保之前的操作对其他CPU可见
+
+#### 3. 执行流程中的同步
+
+在`tasklet_action`函数中：
+1. **尝试获取锁**：调用`tasklet_trylock(t)`尝试获取运行锁
+2. **执行检查**：只有获取锁成功且tasklet未被禁用时才执行
+3. **释放锁**：执行完成后调用`tasklet_unlock(t)`释放锁
+4. **重新调度**：对于获取锁失败的tasklet，重新加入队列并重新触发软中断
+
+#### 4. 内存屏障
+
+- **smp_mb__before_clear_bit**：在清除运行标志前使用，确保执行结果对其他CPU可见
+- **smp_mb__after_atomic_inc**：在禁用tasklet时使用，确保计数增加对其他CPU可见
+- **smp_mb**：在启用tasklet时使用，确保操作顺序正确
+
+#### 5. 多CPU并发处理
+
+当多个CPU同时尝试执行同一个tasklet时：
+1. 只有一个CPU能成功通过`tasklet_trylock`获取锁
+2. 其他CPU会获取锁失败，将tasklet重新加入队列
+3. 当持有锁的CPU执行完成并释放锁后，重新加入队列的tasklet会在下一次软中断中执行
+
+#### 6. 关键代码分析
+
+**tasklet_action中的同步逻辑**：
+```c
+if (tasklet_trylock(t)) {   // 尝试获取运行锁
+    if (!atomic_read(&t->count)) {  // 检查是否被禁用
+        if (!test_and_clear_bit(TASKLET_STATE_SCHED, &t->state))  // 清除调度标志
+            BUG();
+        t->func(t->data);   // 执行处理函数
+        tasklet_unlock(t);  // 释放运行锁
+        continue;
+    }
+    tasklet_unlock(t);      // 被禁用，释放锁
+}
+
+// 获取锁失败，重新加入队列
+local_irq_disable();
+t->next = NULL;
+*__this_cpu_read(tasklet_vec.tail) = t;
+__this_cpu_write(tasklet_vec.tail, &(t->next));
+__raise_softirq_irqoff(TASKLET_SOFTIRQ);
+local_irq_enable();
+```
+
+这种设计确保了：
+- **互斥执行**：同一tasklet在同一时间只能在一个CPU上执行
+- **顺序执行**：如果tasklet被多个CPU调度，会按顺序执行，不会并行
+- **最终执行**：即使获取锁失败，tasklet也会被重新调度，确保最终会执行
+- **高效性**：使用原子操作而非重量级锁，开销小
+
+通过这些同步机制，Linux内核保证了tasklet执行的安全性，同时又保持了较高的执行效率。
