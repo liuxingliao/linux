@@ -2,7 +2,7 @@
 
 ## 1. 概述
 
-本文档分析了Linux 2.6.27.19和3.10内核中使用PM8001驱动和libsas驱动的硬盘识别流程，重点关注了2.6版本中存在的问题以及3.10版本中的修复方案。
+本文档分析了Linux 2.6.27.19和3.10内核中使用PM8001驱动和libsas驱动的硬盘识别流程，重点关注了2.6版本中SAS盘存在的问题以及3.10版本中的修复方案。
 
 ## 2. 2.6.27.19内核硬盘识别流程
 
@@ -19,6 +19,8 @@ scsi_scan_host
   └─> sas_scan_host
       └─> sas_discover_domain
           └─> sas_get_port_device
+              └─> sas_discover_end_dev (对于SAS盘)
+                  └─> sas_notify_lldd_dev_found
               └─> sas_discover_sata (对于SATA设备)
                   └─> sas_discover_sata_dev
                       └─> sas_issue_ata_cmd
@@ -91,7 +93,7 @@ static int sas_execute_task(struct sas_task *task, void *buffer, int size,
 **问题：** 在`sas_execute_task`函数中，当处理sense key 0x02, 0x04, 0x01（磁盘正在旋转）时，代码会无限循环等待，没有重试次数限制。
 
 **具体分析：**
-- 当磁盘返回sense key 0x02, 0x04, 0x01时，表示磁盘正在旋转，需要等待
+- 当SAS磁盘返回sense key 0x02, 0x04, 0x01时，表示磁盘正在旋转，需要等待
 - 代码会调用`schedule_timeout_interruptible(5*HZ)`等待5秒
 - 但是，这个等待逻辑在`for (retries = 0; retries < 5; retries++)`循环内部
 - 当处理sense key 0x02, 0x04, 0x01时，代码没有`continue`或`break`语句，而是直接继续下一次循环
@@ -128,6 +130,10 @@ scsi_scan_host
   └─> sas_scan_host
       └─> sas_discover_domain
           └─> sas_get_port_device
+              └─> sas_discover_end_dev (对于SAS盘)
+                  └─> sas_discover_event (DISCE_PROBE)
+                      └─> sas_probe_devices
+                          └─> sas_rphy_add
               └─> sas_discover_sata (对于SATA设备)
                   └─> sas_discover_event (DISCE_PROBE)
                       └─> sas_probe_devices
@@ -244,6 +250,8 @@ if ((shdr.sense_key == 6 && shdr.asc == 0x29) ||
 
 ## 6. 结论
 
-Linux 2.6.27.19内核中存在SAS硬盘识别时的无限循环问题，主要原因是在`sas_execute_task`函数中处理磁盘旋转状态时没有重试次数限制。3.10内核通过重构整个硬盘识别流程，改用事件驱动机制和标准错误处理流程，彻底解决了这个问题。
+Linux 2.6.27.19内核中存在SAS硬盘识别时的无限循环问题，主要原因是在`sas_execute_task`函数中处理SAS磁盘旋转状态（sense key 0x02, 0x04, 0x01）时没有重试次数限制。当遇到正在旋转的SAS磁盘时，系统会卡在"Spinning up disk"状态，无法继续启动。
 
-建议用户升级到3.10或更高版本的内核，以避免这个问题的发生。对于无法升级内核的用户，可以采用临时修复方案，在`sas_execute_task`函数中添加重试次数限制。
+3.10内核通过重构整个硬盘识别流程，改用事件驱动机制和标准错误处理流程，彻底解决了这个问题。新的实现不再使用有问题的`sas_execute_task`函数，而是通过`sas_discover_event`和`sas_probe_devices`等函数来处理设备发现和初始化，具有完善的错误处理和超时机制。
+
+建议用户升级到3.10或更高版本的内核，以避免这个问题的发生。对于无法升级内核的用户，可以采用临时修复方案，在`sas_execute_task`函数中添加重试次数限制，确保即使磁盘长时间旋转也不会导致系统无限等待。
