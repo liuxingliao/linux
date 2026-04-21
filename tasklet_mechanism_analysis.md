@@ -459,9 +459,104 @@ static void pm8001_tasklet(unsigned long opaque)
 #endif
 ```
 
-## 12. Tasklet执行CPU分配
+## 12. Tasklet核心特性在代码中的体现
 
-### 12.1 Tasklet的CPU分配机制
+### 12.1 同一tasklet在同一时间只能在一个CPU上执行
+
+**代码体现**：
+- **锁机制**：在`tasklet_action`函数中：
+  ```c
+  if (tasklet_trylock(t)) {   // 尝试获取运行锁
+      if (!atomic_read(&t->count)) {  // 检查是否被禁用
+          if (!test_and_clear_bit(TASKLET_STATE_SCHED, &t->state))  // 清除调度标志
+              BUG();
+          t->func(t->data);   // 执行处理函数
+          tasklet_unlock(t);  // 释放运行锁
+          continue;
+      }
+      tasklet_unlock(t);      // 被禁用，释放锁
+  }
+  ```
+
+- **原子操作**：`tasklet_trylock`函数：
+  ```c
+  static inline int tasklet_trylock(struct tasklet_struct *t)
+  {
+      return !test_and_set_bit(TASKLET_STATE_RUN, &t->state);
+  }
+  ```
+  - 使用`test_and_set_bit`原子操作尝试设置`TASKLET_STATE_RUN`标志
+  - 只有一个CPU能成功获取锁，其他CPU会失败
+
+### 12.2 不同tasklet可以在不同CPU上并行执行
+
+**代码体现**：
+- **per-CPU队列**：在tasklet队列定义中：
+  ```c
+  static DEFINE_PER_CPU(struct tasklet_head, tasklet_vec);      // 普通优先级tasklet队列
+  static DEFINE_PER_CPU(struct tasklet_head, tasklet_hi_vec);    // 高优先级tasklet队列
+  ```
+  - 每个CPU有自己独立的tasklet队列
+  - 不同CPU可以同时处理各自队列中的不同tasklet
+
+- **调度机制**：在`__tasklet_schedule`函数中：
+  ```c
+  void __tasklet_schedule(struct tasklet_struct *t)
+  {
+      unsigned long flags;
+      local_irq_save(flags);
+      t->next = NULL;
+      *__this_cpu_read(tasklet_vec.tail) = t;  // 添加到当前CPU的队列
+      __this_cpu_write(tasklet_vec.tail, &(t->next));
+      raise_softirq_irqoff(TASKLET_SOFTIRQ);
+      local_irq_restore(flags);
+  }
+  ```
+  - 使用`__this_cpu_read`和`__this_cpu_write`操作当前CPU的队列
+  - 不同tasklet可以被调度到不同CPU的队列中
+
+### 12.3 tasklet可以被调度多次，但只会执行一次
+
+**代码体现**：
+- **调度标志**：在`tasklet_schedule`函数中：
+  ```c
+  static inline void tasklet_schedule(struct tasklet_struct *t)
+  {
+      if (!test_and_set_bit(TASKLET_STATE_SCHED, &t->state))  // 尝试设置调度标志
+          __tasklet_schedule(t);  // 只有未调度过才执行
+  }
+  ```
+  - 使用`test_and_set_bit`原子操作设置`TASKLET_STATE_SCHED`标志
+  - 如果tasklet已经被调度（标志已设置），则不会重复调度
+
+- **执行时清除标志**：在`tasklet_action`函数中：
+  ```c
+  if (!test_and_clear_bit(TASKLET_STATE_SCHED, &t->state))  // 清除调度标志
+      BUG();
+  t->func(t->data);   // 执行处理函数
+  ```
+  - 执行前清除调度标志，允许下一次调度
+
+### 12.4 tasklet在软中断上下文中执行，具有中断上下文的特性
+
+**代码体现**：
+- **软中断处理函数**：`tasklet_action`是软中断处理函数，注册到`TASKLET_SOFTIRQ`软中断
+
+- **执行上下文特性**：
+  - **不能睡眠**：在中断上下文中执行，不能调用可能导致睡眠的函数
+  - **不可抢占**：不会被进程调度器抢占
+  - **有限的栈空间**：使用中断栈，空间有限（通常为几KB）
+  - **无进程上下文**：不关联任何进程描述符
+
+- **软中断触发**：在`__tasklet_schedule`函数中：
+  ```c
+  raise_softirq_irqoff(TASKLET_SOFTIRQ);  // 触发软中断
+  ```
+  - 通过触发软中断来调度tasklet执行
+
+## 13. Tasklet执行CPU分配
+
+### 13.1 Tasklet的CPU分配机制
 
 Tasklet的执行CPU并不是固定的，而是取决于以下因素：
 
@@ -470,7 +565,7 @@ Tasklet的执行CPU并不是固定的，而是取决于以下因素：
 - **并发处理**：如果多个CPU同时触发中断并调用`tasklet_schedule`，由于`test_and_set_bit`的原子操作，只有一个CPU会成功设置调度标志并将tasklet加入队列
 - **执行位置**：tasklet最终会在**成功调度它的那个CPU**上执行
 
-### 12.2 PM8001驱动中的tasklet执行
+### 13.2 PM8001驱动中的tasklet执行
 
 在PM8001驱动中：
 
@@ -486,7 +581,7 @@ Tasklet的执行CPU并不是固定的，而是取决于以下因素：
 
 这种设计允许tasklet在不同的CPU上执行，提高了系统的灵活性和负载均衡能力。
 
-## 13. 总结
+## 14. 总结
 
 Tasklet是Linux内核中一种高效的底半部处理机制，特别适合处理中断服务程序中的非紧急任务。通过将耗时的处理工作延迟到软中断上下文执行，Tasklet机制有效地提高了系统的响应速度和吞吐量。
 
@@ -502,9 +597,9 @@ Tasklet机制的核心优势在于：
 
 通过合理使用Tasklet机制，驱动程序可以在保证中断响应速度的同时，高效地处理各种中断事件，为系统的稳定运行提供保障。
 
-## 14. FAQ
+## 15. FAQ
 
-### 14.1 Tasklet在Linux内核中主要用于处理什么样的场景？它的设计目标是什么？
+### 15.1 Tasklet在Linux内核中主要用于处理什么样的场景？它的设计目标是什么？
 
 **Tasklet的主要应用场景**：
 
@@ -525,7 +620,7 @@ Tasklet机制的核心优势在于：
 
 Tasklet的设计理念是在保证中断响应速度的同时，高效地处理各种中断事件，为系统的稳定运行提供保障。
 
-### 14.2 Tasklet的调度和执行机制是怎样的？
+### 15.2 Tasklet的调度和执行机制是怎样的？
 
 当一个tasklet被`tasklet_schedule`调度后，到它在软中断上下文中被执行，中间经历了以下关键步骤：
 
@@ -627,7 +722,7 @@ t->func(t->data)
 
 这种设计既保证了tasklet执行的安全性和可靠性，又充分利用了多CPU系统的并行处理能力，是Linux内核中处理底半部任务的高效机制。
 
-### 14.3 如何保证同一tasklet实例在同一时间只能在一个CPU上执行？
+### 15.3 如何保证同一tasklet实例在同一时间只能在一个CPU上执行？
 
 Linux内核通过以下同步机制确保同一tasklet实例在同一时间只能在一个CPU上执行：
 
@@ -715,7 +810,7 @@ local_irq_enable();
 
 通过这些同步机制，Linux内核保证了tasklet执行的安全性，同时又保持了较高的执行效率。
 
-### 14.4 高优先级tasklet和普通tasklet的区别
+### 15.4 高优先级tasklet和普通tasklet的区别
 
 高优先级tasklet（使用`tasklet_hi_schedule`调度）和普通tasklet（使用`tasklet_schedule`调度）在调度和执行上有以下主要区别：
 
@@ -822,7 +917,7 @@ void __tasklet_hi_schedule(struct tasklet_struct *t)
 
 通过提供高优先级和普通tasklet两种机制，Linux内核允许开发者根据任务的紧急程度选择合适的调度方式，从而更好地满足不同场景的需求。
 
-### 14.5 为什么tasklet设计成同一实例不能并发执行，而不同tasklet可以并行执行？
+### 15.5 为什么tasklet设计成同一实例不能并发执行，而不同tasklet可以并行执行？
 
 #### 1. 设计原因
 
@@ -882,7 +977,7 @@ void __tasklet_hi_schedule(struct tasklet_struct *t)
 
 这种设计既保证了tasklet执行的安全性和可靠性，又充分利用了多CPU系统的并行处理能力，是Linux内核中处理底半部任务的高效机制。
 
-### 14.6 Tasklet与工作队列(Workqueue)的深入对比
+### 15.6 Tasklet与工作队列(Workqueue)的深入对比
 
 Tasklet和工作队列都是Linux内核中常用的底半部处理机制，但它们在设计理念、执行环境和使用场景上有显著区别。
 
@@ -976,7 +1071,7 @@ Tasklet和工作队列都是Linux内核中常用的底半部处理机制，但�
 
 在实际应用中，开发者应根据任务的特性和要求选择合适的底半部处理机制，以达到最佳的系统性能和可靠性。
 
-### 14.7 Tasklet为什么不能睡眠或阻塞？
+### 15.7 Tasklet为什么不能睡眠或阻塞？
 
 Tasklet不能睡眠或阻塞的原因主要与它的执行上下文和设计目标有关：
 
@@ -1063,7 +1158,7 @@ Tasklet不能睡眠或阻塞的原因主要与它的执行上下文和设计目�
 
 对于需要睡眠或执行时间较长的任务，应该使用工作队列（workqueue）而不是tasklet。
 
-### 14.8 Tasklet的优先级是如何确定的？是否可以调整？
+### 15.8 Tasklet的优先级是如何确定的？是否可以调整？
 
 #### 1. Tasklet的优先级机制
 
@@ -1108,7 +1203,7 @@ static struct softirq_action softirq_vec[NR_SOFTIRQS] __cacheline_aligned_in_smp
 - 当系统处理软中断时，会按照`softirq_vec`数组的顺序执行
 - 因此，高优先级tasklet（`HI_SOFTIRQ`）会先于普通tasklet（`TASKLET_SOFTIRQ`）执行
 
-### 14.9 如何监控或调试tasklet的执行状态和性能？
+### 15.9 如何监控或调试tasklet的执行状态和性能？
 
 #### 1. 系统工具
 
@@ -1152,7 +1247,7 @@ static struct softirq_action softirq_vec[NR_SOFTIRQS] __cacheline_aligned_in_smp
 - 检查tasklet是否被频繁触发
 - 检查中断处理程序是否正确处理了硬件中断
 
-### 14.10 Tasklet能否被抢占或中断？其执行上下文的特点是什么？
+### 15.10 Tasklet能否被抢占或中断？其执行上下文的特点是什么？
 
 #### 1. 抢占和中断特性
 
@@ -1185,7 +1280,7 @@ static struct softirq_action softirq_vec[NR_SOFTIRQS] __cacheline_aligned_in_smp
 - 不能调用`schedule()`
 - 不能执行用户空间代码
 
-### 14.11 Tasklet在异常情况（如执行超时或错误）下的处理机制是什么？
+### 15.11 Tasklet在异常情况（如执行超时或错误）下的处理机制是什么？
 
 #### 1. 执行超时处理
 
@@ -1218,7 +1313,7 @@ static struct softirq_action softirq_vec[NR_SOFTIRQS] __cacheline_aligned_in_smp
 - 对于可恢复的错误，tasklet应该自行处理并恢复
 - 对于不可恢复的错误，可能需要重启系统或相关服务
 
-### 14.12 在实际驱动开发中，使用tasklet时需要注意哪些常见陷阱？
+### 15.12 在实际驱动开发中，使用tasklet时需要注意哪些常见陷阱？
 
 #### 1. 常见陷阱
 
