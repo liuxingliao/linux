@@ -461,98 +461,51 @@ static void pm8001_tasklet(unsigned long opaque)
 
 ## 12. Tasklet核心特性在代码中的体现
 
+本章汇总了tasklet的核心特性在代码中的具体实现，是对前面章节内容的总结和集中展示。
+
 ### 12.1 同一tasklet在同一时间只能在一个CPU上执行
 
-**代码体现**：
-- **锁机制**：在`tasklet_action`函数中：
-  ```c
-  if (tasklet_trylock(t)) {   // 尝试获取运行锁
-      if (!atomic_read(&t->count)) {  // 检查是否被禁用
-          if (!test_and_clear_bit(TASKLET_STATE_SCHED, &t->state))  // 清除调度标志
-              BUG();
-          t->func(t->data);   // 执行处理函数
-          tasklet_unlock(t);  // 释放运行锁
-          continue;
-      }
-      tasklet_unlock(t);      // 被禁用，释放锁
-  }
-  ```
+**实现机制**：
+- **原子锁**：通过`tasklet_trylock`函数使用`test_and_set_bit`原子操作设置`TASKLET_STATE_RUN`标志
+- **执行控制**：在`tasklet_action`函数中，只有获取锁成功的CPU才能执行tasklet
+- **互斥保证**：其他CPU尝试执行同一tasklet时会失败，将其重新加入队列
 
-- **原子操作**：`tasklet_trylock`函数：
-  ```c
-  static inline int tasklet_trylock(struct tasklet_struct *t)
-  {
-      return !test_and_set_bit(TASKLET_STATE_RUN, &t->state);
-  }
-  ```
-  - 使用`test_and_set_bit`原子操作尝试设置`TASKLET_STATE_RUN`标志
-  - 只有一个CPU能成功获取锁，其他CPU会失败
+**关键代码**：
+- `tasklet_trylock`函数：使用原子操作尝试获取运行锁
+- `tasklet_action`函数：检查锁状态并执行tasklet
 
 ### 12.2 不同tasklet可以在不同CPU上并行执行
 
-**代码体现**：
-- **per-CPU队列**：在tasklet队列定义中：
-  ```c
-  static DEFINE_PER_CPU(struct tasklet_head, tasklet_vec);      // 普通优先级tasklet队列
-  static DEFINE_PER_CPU(struct tasklet_head, tasklet_hi_vec);    // 高优先级tasklet队列
-  ```
-  - 每个CPU有自己独立的tasklet队列
-  - 不同CPU可以同时处理各自队列中的不同tasklet
+**实现机制**：
+- **per-CPU队列**：每个CPU有独立的`tasklet_vec`和`tasklet_hi_vec`队列
+- **本地调度**：`__tasklet_schedule`函数将tasklet添加到当前CPU的队列
+- **并行处理**：不同CPU可以同时处理各自队列中的不同tasklet
 
-- **调度机制**：在`__tasklet_schedule`函数中：
-  ```c
-  void __tasklet_schedule(struct tasklet_struct *t)
-  {
-      unsigned long flags;
-      local_irq_save(flags);
-      t->next = NULL;
-      *__this_cpu_read(tasklet_vec.tail) = t;  // 添加到当前CPU的队列
-      __this_cpu_write(tasklet_vec.tail, &(t->next));
-      raise_softirq_irqoff(TASKLET_SOFTIRQ);
-      local_irq_restore(flags);
-  }
-  ```
-  - 使用`__this_cpu_read`和`__this_cpu_write`操作当前CPU的队列
-  - 不同tasklet可以被调度到不同CPU的队列中
+**关键代码**：
+- 队列定义：`static DEFINE_PER_CPU(struct tasklet_head, tasklet_vec);`
+- 调度函数：`__tasklet_schedule`将tasklet添加到当前CPU队列
 
 ### 12.3 tasklet可以被调度多次，但只会执行一次
 
-**代码体现**：
-- **调度标志**：在`tasklet_schedule`函数中：
-  ```c
-  static inline void tasklet_schedule(struct tasklet_struct *t)
-  {
-      if (!test_and_set_bit(TASKLET_STATE_SCHED, &t->state))  // 尝试设置调度标志
-          __tasklet_schedule(t);  // 只有未调度过才执行
-  }
-  ```
-  - 使用`test_and_set_bit`原子操作设置`TASKLET_STATE_SCHED`标志
-  - 如果tasklet已经被调度（标志已设置），则不会重复调度
+**实现机制**：
+- **调度标志**：`tasklet_schedule`函数使用`test_and_set_bit`设置`TASKLET_STATE_SCHED`标志
+- **重复检测**：如果tasklet已被调度（标志已设置），则不会重复调度
+- **标志清除**：执行前在`tasklet_action`函数中清除调度标志，允许下一次调度
 
-- **执行时清除标志**：在`tasklet_action`函数中：
-  ```c
-  if (!test_and_clear_bit(TASKLET_STATE_SCHED, &t->state))  // 清除调度标志
-      BUG();
-  t->func(t->data);   // 执行处理函数
-  ```
-  - 执行前清除调度标志，允许下一次调度
+**关键代码**：
+- 调度函数：`tasklet_schedule`中的原子操作检测
+- 执行函数：`tasklet_action`中的标志清除
 
 ### 12.4 tasklet在软中断上下文中执行，具有中断上下文的特性
 
-**代码体现**：
-- **软中断处理函数**：`tasklet_action`是软中断处理函数，注册到`TASKLET_SOFTIRQ`软中断
+**实现机制**：
+- **软中断注册**：`tasklet_action`作为软中断处理函数注册到`TASKLET_SOFTIRQ`
+- **上下文特性**：继承中断上下文的特性，包括不能睡眠、不可抢占、有限栈空间等
+- **软中断触发**：通过`raise_softirq_irqoff`触发软中断来调度执行
 
-- **执行上下文特性**：
-  - **不能睡眠**：在中断上下文中执行，不能调用可能导致睡眠的函数
-  - **不可抢占**：不会被进程调度器抢占
-  - **有限的栈空间**：使用中断栈，空间有限（通常为几KB）
-  - **无进程上下文**：不关联任何进程描述符
-
-- **软中断触发**：在`__tasklet_schedule`函数中：
-  ```c
-  raise_softirq_irqoff(TASKLET_SOFTIRQ);  // 触发软中断
-  ```
-  - 通过触发软中断来调度tasklet执行
+**关键代码**：
+- 软中断触发：`raise_softirq_irqoff(TASKLET_SOFTIRQ);`
+- 执行上下文：`tasklet_action`函数在软中断上下文中执行
 
 ## 13. Tasklet执行CPU分配
 
