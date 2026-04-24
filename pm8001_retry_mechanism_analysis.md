@@ -511,6 +511,91 @@ SATA盘的完整处理流程：
 
 ---
 
+## 11. SCSI层对 `DRIVER_SENSE | CHECK_CONDITION` 的处理
+
+### 11.1 处理流程
+
+当 `cmd->result = (DRIVER_SENSE << 24) | SAM_STAT_CHECK_CONDITION` 时，SCSI中层的处理流程如下：
+
+1. **状态检测**：在 [`scsi_error.c`](file:///workspace/drivers/scsi/scsi_error.c#L748-L749) 中，检测到 `CHECK_CONDITION` 状态：
+
+```c
+case CHECK_CONDITION:
+    return scsi_check_sense(scmd);
+```
+
+2. **分析Sense数据**：调用 [`scsi_check_sense`](file:///workspace/drivers/scsi/scsi_error.c#L489-L648) 函数分析sense数据：
+
+```c
+int scsi_check_sense(struct scsi_cmnd *scmd)
+{
+    // 解析sense数据头
+    if (!scsi_command_normalize_sense(scmd, &sshdr))
+        return FAILED;  /* no valid sense data */
+    
+    // 报告sense数据
+    scsi_report_sense(sdev, &sshdr);
+    
+    // 处理deferred error
+    if (scsi_sense_is_deferred(&sshdr))
+        return NEEDS_RETRY;
+    
+    // 处理ABORTED_COMMAND
+    switch (sshdr.sense_key) {
+    case ABORTED_COMMAND:
+        // 特殊情况处理
+        if (sshdr.asc == 0x10) /* DIF */
+            return SUCCESS;
+        
+        if (sshdr.asc == 0x44 && sdev->sdev_bflags & BLIST_RETRY_ITF)
+            return ADD_TO_MLQUEUE;
+        if (sshdr.asc == 0xc1 && sshdr.ascq == 0x01 &&
+            sdev->sdev_bflags & BLIST_RETRY_ASC_C1)
+            return ADD_TO_MLQUEUE;
+        
+        return NEEDS_RETRY;  // 通常会重试
+    // 其他sense key处理...
+    }
+}
+```
+
+### 11.2 关键处理逻辑
+
+1. **`DRIVER_SENSE` 的作用**：
+   - 表明sense数据是由驱动生成的，而不是设备直接返回的
+   - 不影响处理逻辑，只是标识sense数据的来源
+
+2. **`ABORTED_COMMAND` 的处理**：
+   - 通常返回 `NEEDS_RETRY`，表示需要重试命令
+   - 特殊情况（如DIF错误）返回 `SUCCESS`
+   - 特定ASC码可能返回 `ADD_TO_MLQUEUE`（添加到中层队列重新执行）
+
+3. **重试机制**：
+   - 当 `scsi_check_sense` 返回 `NEEDS_RETRY` 时，SCSI中层会尝试重试命令
+   - 重试次数受 `scsi_cmd_retry_allowed` 限制
+   - 重试失败后会进入错误处理流程
+
+### 11.3 与 `DID_ABORT` 的区别
+
+| 状态 | 处理方式 | 重试行为 | 来源 |
+|------|---------|---------|------|
+| `DID_ABORT` | 直接返回 `SUCCESS`，不分析sense数据 | 不重试 | SAS盘abort |
+| `DRIVER_SENSE | CHECK_CONDITION` | 分析sense数据，可能返回 `NEEDS_RETRY` | 可能重试 | SATA盘abort（通过libata） |
+
+### 11.4 实际案例
+
+当SATA盘发生 `SAS_ABORTED_TASK` 时：
+1. libata生成 `DRIVER_SENSE | CHECK_CONDITION` 状态
+2. SCSI中层调用 `scsi_check_sense` 分析sense数据
+3. sense key通常为 `ABORTED_COMMAND`
+4. `scsi_check_sense` 返回 `NEEDS_RETRY`
+5. SCSI中层尝试重试命令
+6. 如果重试失败，进入错误处理流程
+
+**结论**：`DRIVER_SENSE | CHECK_CONDITION` 状态在SCSI中层会被分析sense数据，对于 `ABORTED_COMMAND` 通常会触发重试，这与直接的 `DID_ABORT` 状态处理完全不同。
+
+---
+
 ## 10. SCSI_EH_ABORT_SCHEDULED状态详解
 
 ### 10.1 何时设置SCSI_EH_ABORT_SCHEDULED
