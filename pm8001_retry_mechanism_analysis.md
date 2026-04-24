@@ -427,3 +427,156 @@ PM8001驱动提供了完整的abort机制：
 4. 通知上层任务已完成（状态为 `DID_ABORT`）
 
 **注意**：Abort本身不会触发重试，但如果在错误恢复成功后，其他未完成的命令可能会被重新调度。
+
+---
+
+## 9. SATA盘IO Abort处理机制
+
+### 9.1 SATA盘与SAS盘的区别
+
+SAS盘使用 `SAS_PROTOCOL_SSP`（SCSI SAS Protocol），而SATA盘使用：
+- `SAS_PROTOCOL_SATA`（直接SATA）
+- `SAS_PROTOCOL_STP`（SATA Tunneling Protocol）
+
+### 9.2 PM8001驱动中SATA任务准备
+
+在 [`pm8001_sas.c`](file:///workspace/drivers/scsi/pm8001/pm8001_sas.c#L469-L470) 中，SATA任务使用 `pm8001_task_prep_ata` 准备：
+
+```c
+case SAS_PROTOCOL_SATA:
+case SAS_PROTOCOL_STP:
+    rc = pm8001_task_prep_ata(pm8001_ha, ccb);
+    break;
+```
+
+### 9.3 SATA任务完成处理
+
+SATA任务完成后，通过 [`sas_ata.c`](file:///workspace/drivers/scsi/libsas/sas_ata.c#L81-L156) 中的 `sas_ata_task_done` 函数处理：
+
+```c
+static void sas_ata_task_done(struct sas_task *task)
+{
+    struct ata_queued_cmd *qc = task->uldd_task;
+    // ...
+    if (stat->stat == SAS_PROTO_RESPONSE || stat->stat == SAM_STAT_GOOD ||
+        ((stat->stat == SAM_STAT_CHECK_CONDITION &&
+          dev->sata_dev.class == ATA_DEV_ATAPI))) {
+        // 处理正常响应
+    } else {
+        ac = sas_to_ata_err(stat);
+        // ...
+    }
+    // ...
+    ata_qc_complete(qc);
+}
+```
+
+### 9.4 SATA盘Abort状态映射
+
+在 [`sas_ata.c`](file:///workspace/drivers/scsi/libsas/sas_ata.c#L68-L70) 中，`sas_to_ata_err` 函数将 `SAS_ABORTED_TASK` 映射为 `AC_ERR_DEV`：
+
+```c
+case SAM_STAT_CHECK_CONDITION:
+case SAS_ABORTED_TASK:
+    return AC_ERR_DEV;
+```
+
+### 9.5 SATA盘IO Abort的scmd->result状态
+
+**关键区别**：对于SATA盘，由于使用libata框架处理，**不会直接设置 `scmd->result = DID_ABORT << 16`**。
+
+SATA盘的处理流程：
+1. 当任务状态为 `SAS_ABORTED_TASK` 时，映射为 `AC_ERR_DEV`
+2. 通过 `ata_qc_complete(qc)` 完成，由libata框架处理
+3. 最终通过libata的错误处理机制处理，**不经过标准的SCSI `scmd->result` 路径**
+
+---
+
+## 10. SCSI_EH_ABORT_SCHEDULED状态详解
+
+### 10.1 何时设置SCSI_EH_ABORT_SCHEDULED
+
+`SCSI_EH_ABORT_SCHEDULED` 仅在**命令超时时**设置，具体流程如下：
+
+1. **超时检测**：在 [`scsi_error.c`](file:///workspace/drivers/scsi/scsi_error.c#L292-L329) 中，`scsi_times_out` 函数被调用：
+
+```c
+enum blk_eh_timer_return scsi_times_out(struct request *req)
+{
+    struct scsi_cmnd *scmd = blk_mq_rq_to_pdu(req);
+    // ...
+    if (scsi_abort_command(scmd) != SUCCESS) {
+        set_host_byte(scmd, DID_TIME_OUT);
+        scsi_eh_scmd_add(scmd);
+    }
+    // ...
+}
+```
+
+2. **调度Abort**：调用 [`scsi_abort_command`](file:///workspace/drivers/scsi/scsi_error.c#L194-L221) 设置标志：
+
+```c
+static int scsi_abort_command(struct scsi_cmnd *scmd)
+{
+    // ...
+    if (scmd->eh_eflags & SCSI_EH_ABORT_SCHEDULED) {
+        // 之前的abort失败，升级到下一层次
+        return FAILED;
+    }
+    // ...
+    scmd->eh_eflags |= SCSI_EH_ABORT_SCHEDULED;  // 设置标志
+    queue_delayed_work(shost->tmf_work_q, &scmd->abort_work, HZ / 100);
+    return SUCCESS;
+}
+```
+
+### 10.2 SCSI_EH_ABORT_SCHEDULED的作用
+
+1. **标记超时IO**：在 [`scsi_error.c`](file:///workspace/drivers/scsi/scsi_error.c#L1232-L1237) 中，跳过获取sense数据：
+
+```c
+/*
+ * If SCSI_EH_ABORT_SCHEDULED has been set, it is timeout IO,
+ * should not get sense.
+ */
+list_for_each_entry_safe(scmd, next, work_q, eh_entry) {
+    if ((scmd->eh_eflags & SCSI_EH_ABORT_SCHEDULED) ||
+        SCSI_SENSE_VALID(scmd))
+        continue;
+```
+
+2. **统计超时命令**：在 [`scsi_error.c`](file:///workspace/drivers/scsi/scsi_error.c#L374-L377) 中区分失败命令类型：
+
+```c
+if (scmd->eh_eflags & SCSI_EH_ABORT_SCHEDULED)
+    ++cmd_cancel;
+else
+    ++cmd_failed;
+```
+
+3. **处理DID_ABORT**：在 [`scsi_error.c`](file:///workspace/drivers/scsi/scsi_error.c#L1823-L1828) 中，将超时abort转为 `DID_TIME_OUT`：
+
+```c
+case DID_ABORT:
+    if (scmd->eh_eflags & SCSI_EH_ABORT_SCHEDULED) {
+        set_host_byte(scmd, DID_TIME_OUT);
+        return SUCCESS;
+    }
+    fallthrough;
+```
+
+### 10.3 完整的超时处理流程
+
+1. **超时发生**：`scsi_times_out` 被调用
+2. **设置标志**：`scmd->eh_eflags |= SCSI_EH_ABORT_SCHEDULED`
+3. **调度abort**：`queue_delayed_work` 安排执行abort工作
+4. **如果abort失败**：调用 `scsi_eh_scmd_add` 加入错误处理队列
+5. **如果abort成功**：命令返回时，`SCSI_EH_ABORT_SCHEDULED` 标志已设置，被转为 `DID_TIME_OUT`
+
+### 10.4 总结
+
+| 情况 | 是否设置SCSI_EH_ABORT_SCHEDULED | 结果 |
+|------|--------------------------------|------|
+| 命令超时 | 是 | 由超时处理流程处理 |
+| 正常IO返回DID_ABORT | 否 | 直接完成，不重试 |
+| 错误处理期间abort | 是 | 转为DID_TIME_OUT |
