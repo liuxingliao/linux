@@ -271,3 +271,83 @@ SCSI中层 → 重新入队未完成的可重试命令
 2. **渐进式恢复**：从任务级→LUN级→I_T Nexus级，逐步升级恢复措施
 3. **智能重试**：根据错误类型决定是否重试，避免不必要的重试
 4. **硬件辅助**：PM8001硬件提供特定的错误恢复支持
+
+---
+
+## 7. 介质错误处理机制
+
+### 7.1 介质错误概述
+介质错误（MEDIUM_ERROR）是指存储介质本身的物理问题，如坏道、不可恢复的读写错误等。这类错误通常通过SCSI的CHECK CONDITION状态返回，并在sense data中标识。
+
+### 7.2 SCSI层介质错误处理
+
+#### 7.2.1 `scsi_check_sense`函数中的处理
+在 [`scsi_error.c`](file:///workspace/drivers/scsi/scsi_error.c#L618-L625) 中，介质错误的处理逻辑为：
+
+```c
+case MEDIUM_ERROR:
+    if (sshdr.asc == 0x11 || /* UNRECOVERED READ ERR */
+        sshdr.asc == 0x13 || /* AMNF DATA FIELD */
+        sshdr.asc == 0x14) { /* RECORD NOT FOUND */
+        set_host_byte(scmd, DID_MEDIUM_ERROR);
+        return SUCCESS;
+    }
+    return NEEDS_RETRY;
+```
+
+**处理逻辑**：
+- **不可恢复的介质错误**（ASC=0x11, 0x13, 0x14）：直接返回 `SUCCESS`，设置 `DID_MEDIUM_ERROR`，**不重试**
+- **其他介质错误**：返回 `NEEDS_RETRY`，**允许重试**
+
+#### 7.2.2 不可恢复介质错误类型
+| ASC码 | 说明 | 是否重试 |
+|-------|------|---------|
+| 0x11 | UNRECOVERED READ ERROR | 否 |
+| 0x13 | AMNF DATA FIELD | 否 |
+| 0x14 | RECORD NOT FOUND | 否 |
+
+### 7.3 libsas层介质错误传递
+在 [`sas_scsi_host.c`](file:///workspace/drivers/scsi/libsas/sas_scsi_host.c#L85-L92) 中，当任务完成且状态为 `SAM_STAT_CHECK_CONDITION` 时，会将sense data复制到SCSI命令中：
+
+```c
+case SAM_STAT_CHECK_CONDITION:
+    memcpy(sc->sense_buffer, ts->buf,
+           min(SCSI_SENSE_BUFFERSIZE, ts->buf_valid_size));
+    stat = SAM_STAT_CHECK_CONDITION;
+    break;
+```
+
+libsas层本身不处理介质错误的具体逻辑，只是将sense data透传给SCSI中层。
+
+### 7.4 块层对介质错误的处理
+在 [`scsi_lib.c`](file:///workspace/drivers/scsi/scsi_lib.c#L642-L644) 中，`DID_MEDIUM_ERROR` 被映射为块层的 `BLK_STS_MEDIUM` 错误：
+
+```c
+case DID_MEDIUM_ERROR:
+    set_host_byte(cmd, DID_OK);
+    return BLK_STS_MEDIUM;
+```
+
+### 7.5 SCSI磁盘驱动处理
+在 [`sd.c`](file:///workspace/drivers/scsi/sd.c#L2078-L2081) 中，当发生介质错误或硬件错误时，会计算已完成的字节数：
+
+```c
+case HARDWARE_ERROR:
+case MEDIUM_ERROR:
+    good_bytes = sd_completed_bytes(SCpnt);
+    break;
+```
+
+### 7.6 介质错误重试机制总结
+
+| 介质错误类型 | 是否重试 | 处理方式 |
+|------------|---------|---------|
+| 可恢复的介质错误（非0x11/0x13/0x14） | 是 | 返回 `NEEDS_RETRY`，SCSI中层会尝试重试 |
+| 不可恢复的读错误（ASC=0x11） | 否 | 返回 `SUCCESS`，设置 `DID_MEDIUM_ERROR` |
+| AMNF数据字段错误（ASC=0x13） | 否 | 返回 `SUCCESS`，设置 `DID_MEDIUM_ERROR` |
+| 记录未找到（ASC=0x14） | 否 | 返回 `SUCCESS`，设置 `DID_MEDIUM_ERROR` |
+
+**设计理由**：
+- 不可恢复的介质错误重试没有意义，只会浪费时间
+- 某些介质错误可能是临时的（如介质抖动），允许重试
+- 通过sense data中的具体ASC/ASCQ区分可恢复和不可恢复的情况
