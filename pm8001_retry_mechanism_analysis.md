@@ -351,3 +351,79 @@ case MEDIUM_ERROR:
 - 不可恢复的介质错误重试没有意义，只会浪费时间
 - 某些介质错误可能是临时的（如介质抖动），允许重试
 - 通过sense data中的具体ASC/ASCQ区分可恢复和不可恢复的情况
+
+---
+
+## 8. Abort I/O处理机制
+
+### 8.1 Abort I/O概述
+Abort I/O是指由于各种原因（如超时、设备错误等）导致的任务被中止的情况。这类错误通常通过 `DID_ABORT` 主机字节码标识。
+
+### 8.2 SCSI层Abort I/O处理
+
+在 [`scsi_error.c`](file:///workspace/drivers/scsi/scsi_error.c#L1823-L1828) 中，Abort I/O的处理逻辑为：
+
+```c
+case DID_ABORT:
+    if (scmd->eh_eflags & SCSI_EH_ABORT_SCHEDULED) {
+        set_host_byte(scmd, DID_TIME_OUT);
+        return SUCCESS;
+    }
+    fallthrough;
+case DID_NO_CONNECT:
+case DID_BAD_TARGET:
+    return SUCCESS;
+```
+
+**处理逻辑**：
+- **常规Abort**：直接返回 `SUCCESS`，**不重试**
+- **错误处理期间的Abort**（`SCSI_EH_ABORT_SCHEDULED`）：将状态改为 `DID_TIME_OUT` 后返回 `SUCCESS`，**不重试**
+
+### 8.3 libsas层Abort I/O处理
+
+在 [`sas_scsi_host.c`](file:///workspace/drivers/scsi/libsas/sas_scsi_host.c#L82-L84) 中，当任务状态为 `SAS_ABORTED_TASK` 时：
+
+```c
+case SAS_ABORTED_TASK:
+    hs = DID_ABORT;
+    break;
+```
+
+libsas层将 `SAS_ABORTED_TASK` 状态映射为 `DID_ABORT` 主机字节码，传递给SCSI中层处理。
+
+### 8.4 PM8001驱动层Abort处理
+
+PM8001驱动提供了完整的abort机制：
+
+1. **任务级Abort**：`pm8001_abort_task` 函数
+2. **设备级Abort**：`pm8001_exec_internal_task_abort` 函数（支持abort单个任务或所有任务）
+3. **错误恢复中的Abort**：在I_T Nexus重置等操作中使用
+
+### 8.5 Abort I/O重试机制总结
+
+| 场景 | 是否重试 | 处理方式 |
+|------|---------|---------|
+| 常规Abort | 否 | 返回 `SUCCESS`，设置 `DID_ABORT` |
+| 错误处理期间的Abort | 否 | 改为 `DID_TIME_OUT`，返回 `SUCCESS` |
+| SAS_ABORTED_TASK | 否 | 映射为 `DID_ABORT`，不重试 |
+
+**设计理由**：
+- Abort通常意味着任务已经被终止，重试没有意义
+- 某些Abort可能是由于硬件错误或资源问题导致的，需要通过错误恢复流程解决
+- 错误处理期间的Abort会被视为超时，由错误处理流程处理
+
+### 8.6 Abort与错误恢复的关系
+
+当发生Abort时，SCSI中层会：
+1. 标记命令为完成状态
+2. 不进行重试
+3. 如果是在错误处理期间发生的Abort，会将其视为超时
+4. 错误处理流程会尝试通过各种恢复操作（如设备重置、总线重置等）来恢复系统状态
+
+对于PM8001驱动，当检测到需要abort任务时：
+1. 发送abort命令到硬件
+2. 等待abort完成
+3. 清理相关资源
+4. 通知上层任务已完成（状态为 `DID_ABORT`）
+
+**注意**：Abort本身不会触发重试，但如果在错误恢复成功后，其他未完成的命令可能会被重新调度。
