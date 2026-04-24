@@ -485,10 +485,29 @@ case SAS_ABORTED_TASK:
 
 **关键区别**：对于SATA盘，由于使用libata框架处理，**不会直接设置 `scmd->result = DID_ABORT << 16`**。
 
-SATA盘的处理流程：
-1. 当任务状态为 `SAS_ABORTED_TASK` 时，映射为 `AC_ERR_DEV`
-2. 通过 `ata_qc_complete(qc)` 完成，由libata框架处理
-3. 最终通过libata的错误处理机制处理，**不经过标准的SCSI `scmd->result` 路径**
+SATA盘的完整处理流程：
+
+1. **状态映射**：在 [`sas_ata.c`](file:///workspace/drivers/scsi/libsas/sas_ata.c#L68-L70) 中，`sas_to_ata_err` 函数将 `SAS_ABORTED_TASK` 映射为 `AC_ERR_DEV`
+
+2. **错误标记**：在 [`sas_ata.c`](file:///workspace/drivers/scsi/libsas/sas_ata.c#L138-L150) 中，设置 `qc->err_mask = AC_ERR_DEV`，并设置错误寄存器 `dev->sata_dev.fis[3] = 0x04`，状态寄存器 `dev->sata_dev.fis[2] = ATA_ERR`
+
+3. **错误处理调度**：调用 [`ata_qc_complete(qc)`](file:///workspace/drivers/ata/libata-core.c#L4630-L4723)，检测到 `qc->err_mask` 后设置 `ATA_QCFLAG_FAILED`，然后调用 [`ata_qc_schedule_eh(qc)`](file:///workspace/drivers/ata/libata-eh.c#L891-L920) 调度libata错误处理（**不会立即完成命令**）
+
+4. **libata错误处理**：由 `ata_qc_schedule_eh` 触发libata错误处理流程（libata-eh.c），在错误处理中会：
+   - 尝试恢复设备
+   - 可能会重置设备
+   - 根据配置决定是否重试命令
+
+5. **最终返回SCSI层**：当libata错误处理完成后，通过 [`ata_scsi_qc_complete(qc)`](file:///workspace/drivers/ata/libata-scsi.c#L1641-L1671) 完成处理：
+   - 调用 [`ata_gen_ata_sense(qc)`](file:///workspace/drivers/ata/libata-scsi.c#L948-L998) 生成sense数据
+   - 设置 `cmd->result = (DRIVER_SENSE << 24) | SAM_STAT_CHECK_CONDITION`
+   - sense数据通常为 `ABORTED_COMMAND` 相关的错误
+
+**总结**：
+- SATA盘发生 `SAS_ABORTED_TASK` 时，**不会设置 `DID_ABORT`**
+- 会触发libata错误处理流程，**可能会重试**（取决于错误处理策略）
+- 最终返回SCSI层时，`scmd->result` 为 `SAM_STAT_CHECK_CONDITION`，带有sense数据
+- sense数据的具体内容取决于ATA错误寄存器的值，通常为 `ABORTED_COMMAND` sense key
 
 ---
 
